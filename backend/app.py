@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import time
@@ -12,7 +13,7 @@ try:
 except Exception:
     serial = None
 
-from pendulum_processor import PendulumProcessor, decode_ws_message, frame_to_b64
+from pendulum_processor import PendulumProcessor, decode_ws_message, frame_to_b64, build_plot_and_stats
 
 
 # -------------------------------------------------------------------
@@ -21,6 +22,8 @@ from pendulum_processor import PendulumProcessor, decode_ws_message, frame_to_b6
 
 app = Flask(__name__)
 sock = Sock(app)
+session_store: Dict[str, PendulumProcessor] = {}
+session_csv_writers: Dict[str, Tuple[Path, object, csv.writer]] = {}
 
 
 @app.before_request
@@ -61,12 +64,13 @@ def stream(ws):
     Acepta:
       - Texto base64
       - Binario (JPEG/PNG comprimido)
-      - JSON: {"frame": "<b64>", "fps": 30, "timestamp": 0.033}
+      - JSON: {"frame": "<b64>", "fps": 30, "timestamp": 0.033, "session_id": "..."}
     Respuesta:
       - Si la entrada fue JSON -> JSON {"frame": "<b64>", "info": {...}}
       - Si fue base64/binario simple -> solo el frame en base64
     """
     processor = PendulumProcessor()
+    touched_sessions = set()
 
     while True:
         data = ws.receive()
@@ -77,6 +81,10 @@ def stream(ws):
 
         try:
             frame, fps_override, timestamp = decode_ws_message(data)
+            session_id = None
+            if isinstance(data, str) and data.lstrip().startswith("{"):
+                payload = json.loads(data)
+                session_id = payload.get("session_id")
         except Exception as exc:  # noqa: BLE001 - devolver error al cliente
             ws.send(json.dumps({"error": str(exc)}))
             continue
@@ -84,12 +92,44 @@ def stream(ws):
         if fps_override:
             processor.fps = fps_override
 
-        processed, info = processor.process_frame(frame, timestamp=timestamp)
+        target_proc = processor
+        if session_id:
+            target_proc = session_store.setdefault(session_id, PendulumProcessor(fps=processor.fps))
+            touched_sessions.add(session_id)
+
+        processed, info = target_proc.process_frame(frame, timestamp=timestamp)
+
+        if session_id:
+            csv_info = session_csv_writers.get(session_id)
+            if csv_info is None:
+                csv_path = Path(app.root_path).parent / f"datos_pendulo_{session_id}.csv"
+                f_handle = open(csv_path, "w", newline="")
+                writer = csv.writer(f_handle)
+                writer.writerow(["frame", "tiempo_s", "x", "y", "radio"])
+                csv_info = (csv_path, f_handle, writer)
+                session_csv_writers[session_id] = csv_info
+            csv_path, f_handle, writer = csv_info
+            if target_proc.records:
+                last_row = target_proc.records[-1]
+                if len(last_row) >= 5:
+                    writer.writerow(last_row)
+                    f_handle.flush()
 
         if is_json_input:
-            ws.send(json.dumps({"frame": frame_to_b64(processed), "info": info}))
+            ws.send(json.dumps({"frame": frame_to_b64(processed), "info": info, "session_id": session_id}))
         else:
             ws.send(frame_to_b64(processed))
+
+    # cerrar csvs usados en esta conexión
+    for sid in touched_sessions:
+        csv_info = session_csv_writers.get(sid)
+        if csv_info:
+            _, f_handle, _ = csv_info
+            try:
+                f_handle.flush()
+                f_handle.close()
+            except Exception:
+                pass
 
 
 # -------------------------------------------------------------------
@@ -159,6 +199,159 @@ def servo_http():
 
     result = handle_servo_command(port, baudrate)
     return jsonify(result)
+
+
+# -------------------------------------------------------------------
+# ANÁLISIS (matplotlib desde stream)
+# -------------------------------------------------------------------
+
+
+@app.route("/analysis/plot", methods=["POST"])
+def analysis_plot():
+    """
+    Recibe datos del stream y devuelve el PNG base64 de la gráfica + estadísticas,
+    usando la misma lógica que main.py/graficar.py.
+    JSON esperado:
+      {
+        "times": [..],
+        "xs": [..],
+        "ys": [..],
+        "pivot_x": 230?,  // opcional
+        "pivot_y": 120?   // opcional
+      }
+    """
+    payload = request.get_json(silent=True, force=True) or {}
+    times = payload.get("times") or []
+    xs = payload.get("xs") or []
+    ys = payload.get("ys") or []
+    pivot_x = payload.get("pivot_x")
+    pivot_y = payload.get("pivot_y")
+    session_id = payload.get("session_id")
+
+    if not (isinstance(times, list) and isinstance(xs, list) and isinstance(ys, list)):
+        return jsonify({"error": "times/xs/ys deben ser listas"}), 400
+    if not (len(times) == len(xs) == len(ys) and len(times) >= 2):
+        return jsonify({"error": "Se requieren al menos 2 muestras y longitudes iguales"}), 400
+
+    try:
+        times_f = [float(t) for t in times]
+        xs_f = [float(x) for x in xs]
+        ys_f = [float(y) for y in ys]
+        pivot_x_f = float(pivot_x) if pivot_x is not None else None
+        pivot_y_f = float(pivot_y) if pivot_y is not None else None
+    except Exception:
+        return jsonify({"error": "No se pudieron convertir los datos a float"}), 400
+
+    output = build_plot_and_stats(times_f, xs_f, ys_f, pivot_x=pivot_x_f, pivot_y=pivot_y_f)
+    if session_id and session_id in session_store:
+        processor = session_store[session_id]
+        csv_info = session_csv_writers.get(session_id)
+        if csv_info:
+            csv_path, f_handle, _ = csv_info
+            try:
+                f_handle.flush()
+            except Exception:
+                pass
+            output["csv_path"] = str(csv_path)
+        elif processor.has_data:
+            export_path = Path(app.root_path).parent / f"datos_pendulo_{session_id}.csv"
+            processor.export_csv(str(export_path))
+            output["csv_path"] = str(export_path)
+    if not output.get("plot"):
+        return jsonify({"error": "No se pudo generar la gráfica"}), 400
+    return jsonify(output)
+
+
+@app.route("/analysis/export_csv", methods=["POST"])
+def analysis_export_csv():
+    """
+    Guarda el CSV de la sesión indicada.
+    JSON esperado: {"session_id": "..."}.
+    """
+    payload = request.get_json(silent=True, force=True) or {}
+    session_id = payload.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id es requerido"}), 400
+
+    processor = session_store.get(session_id)
+    if not processor or not processor.has_data:
+        return jsonify({"error": "No hay datos para esa sesión"}), 404
+
+    export_path = Path(app.root_path).parent / f"datos_pendulo_{session_id}.csv"
+    processor.export_csv(str(export_path))
+    return jsonify({"ok": True, "path": str(export_path)})
+
+
+@app.route("/analysis/finalize_csv", methods=["POST"])
+def analysis_finalize_csv():
+    """
+    Fuerza el guardado del CSV para la sesión indicada y devuelve la ruta.
+    """
+    payload = request.get_json(silent=True, force=True) or {}
+    session_id = payload.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id es requerido"}), 400
+
+    csv_info = session_csv_writers.get(session_id)
+    if csv_info:
+        csv_path, f_handle, _ = csv_info
+        try:
+            f_handle.flush()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "path": str(csv_path)})
+
+    processor = session_store.get(session_id)
+    if processor and processor.has_data:
+        export_path = Path(app.root_path).parent / f"datos_pendulo_{session_id}.csv"
+        processor.export_csv(str(export_path))
+        return jsonify({"ok": True, "path": str(export_path)})
+
+    return jsonify({"error": "No hay datos para esa sesión"}), 404
+
+
+@app.route("/analysis/plot_csv", methods=["POST"])
+def analysis_plot_csv():
+    """
+    Genera gráfica y stats a partir de un CSV ya guardado.
+    Payload: {"session_id": "..."} o {"path": "<ruta_csv>"}.
+    """
+    payload = request.get_json(silent=True, force=True) or {}
+    session_id = payload.get("session_id")
+    path = payload.get("path")
+
+    csv_path = None
+    if path:
+        csv_path = Path(path)
+    elif session_id:
+        csv_path = Path(app.root_path).parent / f"datos_pendulo_{session_id}.csv"
+
+    if not csv_path or not csv_path.exists():
+        return jsonify({"error": "CSV no encontrado"}), 404
+
+    times: list[float] = []
+    xs: list[float] = []
+    ys: list[float] = []
+
+    try:
+        with open(csv_path, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            for row in reader:
+                if len(row) < 5:
+                    continue
+                _, t, x, y, _ = row
+                times.append(float(t))
+                xs.append(float(x))
+                ys.append(float(y))
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"No se pudo leer el CSV: {exc}"}), 400
+
+    output = build_plot_and_stats(times, xs, ys)
+    output["csv_path"] = str(csv_path)
+    if not output.get("plot"):
+        return jsonify({"error": "No se pudo generar la gráfica"}), 400
+    return jsonify(output)
 
 
 # -------------------------------------------------------------------

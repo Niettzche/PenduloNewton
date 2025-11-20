@@ -1,12 +1,17 @@
 import base64
 import csv
 import json
+import io
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from scipy.signal import savgol_filter
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from dataclasses import asdict
 
 # ------------ CONFIGURACIÓN PARA BOLA NARANJA SOBRE FONDO NEGRO ------------
 ORANGE_LOWER = np.array([5, 140, 80], dtype=np.uint8)  # H, S, V
@@ -124,6 +129,51 @@ def _compute_physical_stats(times, xs, ys, pivot_x=None, pivot_y=None, fallback_
         pivot_x=float(px),
         pivot_y=float(py),
     )
+
+
+def generate_angle_plot(times, xs, ys, pivot_x=None, pivot_y=None, fallback_px=230, fallback_py=120):
+    """
+    Replica la gráfica de main.py/graficar.py usando Matplotlib y devuelve el PNG en base64.
+    """
+    if len(times) < 2:
+        return None
+
+    px = pivot_x if pivot_x is not None else fallback_px
+    py = pivot_y if pivot_y is not None else fallback_py
+
+    arr_t = np.array(times)
+    arr_x = _savgol_or_original(xs)
+    arr_y = _savgol_or_original(ys)
+
+    dx = arr_x - px
+    dy = arr_y - py
+    theta_deg = np.degrees(np.arctan2(dx, dy))
+    theta_smooth = _savgol_or_original(theta_deg)
+
+    fig, ax = plt.subplots(figsize=(6, 8))
+    ax.plot(arr_t, theta_deg, ".", alpha=0.2, label="Ángulo crudo (ruido)")
+    ax.plot(arr_t, theta_smooth, "-", linewidth=2, label="Ángulo suavizado (real)")
+    ax.set_xlabel("Tiempo (s)")
+    ax.set_ylabel("Ángulo θ (grados)")
+    ax.set_title("Ángulo del péndulo vs tiempo (en tiempo real)")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+
+    buff = io.BytesIO()
+    fig.savefig(buff, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return base64.b64encode(buff.getvalue()).decode("ascii")
+
+
+def build_plot_and_stats(times, xs, ys, pivot_x=None, pivot_y=None, fallback_px=230, fallback_py=120):
+    """
+    Devuelve {"plot": <b64 png>, "stats": {...}} usando la misma lógica que main.py/graficar.py.
+    """
+    plot_b64 = generate_angle_plot(times, xs, ys, pivot_x=pivot_x, pivot_y=pivot_y, fallback_px=fallback_px, fallback_py=fallback_py)
+    stats_obj = _compute_physical_stats(times, xs, ys, pivot_x=pivot_x, pivot_y=pivot_y, fallback_px=fallback_px, fallback_py=fallback_py)
+    stats = asdict(stats_obj) if stats_obj else None
+    return {"plot": plot_b64, "stats": stats}
 
 
 class PendulumProcessor:
@@ -338,6 +388,10 @@ class PendulumProcessor:
             writer = csv.writer(f)
             writer.writerow(["frame", "tiempo_s", "x", "y", "radio"])
             writer.writerows(self.records)
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.records)
 
 
 def b64_to_frame(b64_data: str) -> np.ndarray:
