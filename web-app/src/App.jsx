@@ -1,11 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
+import { PIVOT_DEFAULTS, savgolOrOriginal } from './pendulumAnalysis'
 
 const SERVO_PATH = '/servo'
 const DESIRED_FPS = 5
 const JPEG_QUALITY = 0.4
 
+const generateSessionId = () =>
+  window.crypto?.randomUUID
+    ? window.crypto.randomUUID()
+    : `session-${Date.now()}-${Math.random().toString(16).slice(2)}`
+
 function App() {
+  const [sessionId, setSessionId] = useState(generateSessionId)
   const [status, setStatus] = useState('idle') // idle | connecting | active
   const [message, setMessage] = useState('Preparando...')
   const [serverIp, setServerIp] = useState('')
@@ -13,6 +20,14 @@ function App() {
   const [servoOn, setServoOn] = useState(false)
   const [backendFrame, setBackendFrame] = useState('')
   const [backendInfo, setBackendInfo] = useState('')
+  const [analysisPlot, setAnalysisPlot] = useState('')
+  const [analysisSummary, setAnalysisSummary] = useState([])
+  const [analysisStats, setAnalysisStats] = useState(null)
+  const [analysisStatus, setAnalysisStatus] = useState('')
+  const [analysisError, setAnalysisError] = useState('')
+  const [samplesCount, setSamplesCount] = useState(0)
+  const [liveTimes, setLiveTimes] = useState([])
+  const [liveAngles, setLiveAngles] = useState([])
 
   const socketRef = useRef(null)
   const loopRef = useRef(null)
@@ -21,6 +36,26 @@ function App() {
   const livePreviewRef = useRef(null)
   const canvasRef = useRef(null)
   const backendUrlRef = useRef('')
+  const sessionIdRef = useRef(sessionId)
+
+  const getTargetHost = useCallback(
+    () => (import.meta.env.DEV ? window.location.host : serverIp || window.location.host),
+    [serverIp],
+  )
+
+  const samplesRef = useRef(0)
+
+  const resetAnalysis = useCallback(() => {
+    setAnalysisPlot('')
+    setAnalysisSummary([])
+    setAnalysisStats(null)
+    setAnalysisStatus('')
+    setAnalysisError('')
+    setSamplesCount(0)
+    setLiveTimes([])
+    setLiveAngles([])
+    samplesRef.current = 0
+  }, [])
 
   const updateStatus = useCallback((nextStatus, nextMessage) => {
     setStatus(nextStatus)
@@ -93,6 +128,7 @@ function App() {
         frame: base64,
         fps: DESIRED_FPS,
         timestamp: Date.now() / 1000,
+        session_id: sessionIdRef.current,
       })
       socket.send(payload)
     } catch {
@@ -113,6 +149,15 @@ function App() {
     if (payload?.message) setMessage(payload.message)
   }, [])
 
+  const liveChartData = useMemo(() => {
+    if (!liveTimes.length || !liveAngles.length) return null
+    const t0 = liveTimes[0]
+    const times = liveTimes.map((t) => t - t0)
+    const anglesSmooth = savgolOrOriginal(liveAngles)
+    const maxAbs = Math.max(20, ...anglesSmooth.map((v) => Math.abs(v)))
+    return { times, angles: liveAngles, smooth: anglesSmooth, maxAbs }
+  }, [liveAngles, liveTimes])
+
   const handleBackendPayload = useCallback((frame, info) => {
     if (frame) {
       if (backendUrlRef.current) {
@@ -124,6 +169,21 @@ function App() {
     if (info) {
       const time = info.time_s != null ? Number(info.time_s).toFixed(2) : '-'
       setBackendInfo(`t=${time}s  oscilaciones=${info.oscillations ?? '-'}`)
+      if (info.x != null && info.y != null) {
+        samplesRef.current += 1
+        setSamplesCount(samplesRef.current)
+        setLiveTimes((prev) => {
+          const next = [...prev, Number(info.time_s ?? prev.length)]
+          return next.length > 500 ? next.slice(-500) : next
+        })
+        setLiveAngles((prev) => {
+          const px = info.center_x ?? PIVOT_DEFAULTS.x
+          const py = info.line_y ?? PIVOT_DEFAULTS.y
+          const thetaDeg = (Math.atan2(Number(info.x) - px, Number(info.y) - py) * 180) / Math.PI
+          const next = [...prev, thetaDeg]
+          return next.length > 500 ? next.slice(-500) : next
+        })
+      }
     } else {
       setBackendInfo('')
     }
@@ -168,6 +228,64 @@ function App() {
     [applyServoStatus, handleBackendPayload, handleBinaryMessage],
   )
 
+  const requestAnalysis = useCallback(
+    async (targetSessionId = '') => {
+      const sessionToUse =
+        typeof targetSessionId === 'string' && targetSessionId.trim()
+          ? targetSessionId
+          : sessionIdRef.current
+      const targetHost = getTargetHost()
+      if (!targetHost) {
+        setAnalysisError('Host del backend no definido')
+      return
+    }
+
+    setAnalysisStatus('Generando gráfica y resumen...')
+    setAnalysisError('')
+    if (!sessionToUse) {
+      setAnalysisError('No hay sesión activa para analizar')
+      setAnalysisStatus('')
+      return
+    }
+    if (samplesRef.current === 0) {
+      setAnalysisError('No hay datos capturados en esta sesión')
+      setAnalysisStatus('')
+      return
+    }
+    try {
+      const url = new URL('/analysis/session_summary', window.location.origin)
+      url.host = targetHost
+      url.protocol = url.protocol === 'https:' ? 'https:' : 'http:'
+      const res = await fetch(url.toString(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionToUse }),
+        })
+        const raw = await res.text()
+        let data = {}
+        if (raw) {
+          try {
+            data = JSON.parse(raw)
+          } catch {
+            throw new Error('Respuesta del backend no es JSON válido')
+          }
+        }
+        if (!res.ok || data?.error) {
+          const errMsg = data?.error || `El backend devolvió un error (${res.status})`
+          throw new Error(errMsg)
+        }
+        setAnalysisPlot(data.plot ? `data:image/png;base64,${data.plot}` : '')
+        setAnalysisSummary(data.summary_lines || [])
+        setAnalysisStats(data.stats || null)
+        setAnalysisStatus('Resumen generado con los datos del stream')
+      } catch (err) {
+        setAnalysisError(err?.message || 'No se pudo generar la gráfica')
+        setAnalysisStatus('')
+      }
+    },
+    [getTargetHost],
+  )
+
   const startTransmission = useCallback(async () => {
     updateStatus('connecting', 'Solicitando cámara...')
     const ok = await ensureCamera()
@@ -176,7 +294,14 @@ function App() {
       return
     }
 
-    const targetHost = import.meta.env.DEV ? window.location.host : serverIp || window.location.host
+    const newSession = generateSessionId()
+    setSessionId(newSession)
+    sessionIdRef.current = newSession
+    samplesRef.current = 0
+    resetAnalysis()
+    const sessionForSocket = newSession
+
+    const targetHost = getTargetHost()
     if (!targetHost) {
       updateStatus('idle', 'Host del backend no definido')
       return
@@ -205,13 +330,19 @@ function App() {
       socketRef.current = null
       setServoOn(false)
       updateStatus('idle', 'Conexión cerrada')
+      if (samplesRef.current > 0) {
+        void requestAnalysis(sessionForSocket)
+      } else {
+        setAnalysisError('No se capturaron datos en la sesión')
+        setAnalysisStatus('')
+      }
     }
-  }, [ensureCamera, handleMessage, serverIp, startLoop, stopLoop, updateStatus])
+  }, [ensureCamera, getTargetHost, handleMessage, requestAnalysis, resetAnalysis, startLoop, stopLoop, updateStatus])
 
   const toggleServo = useCallback(async () => {
     const next = !servoOn
 
-    const targetHost = import.meta.env.DEV ? window.location.host : serverIp || window.location.host
+    const targetHost = getTargetHost()
     if (!targetHost) {
       setMessage('Host del backend no definido')
       return
@@ -232,7 +363,7 @@ function App() {
     } catch {
       setMessage('No se pudo contactar al backend para el servo')
     }
-  }, [applyServoStatus, servoOn, serverIp])
+  }, [applyServoStatus, getTargetHost, servoOn])
 
   const loadServerIp = useCallback(async () => {
     const candidates = ['/server.json', '/app/server.json', '../server.json']
@@ -285,6 +416,13 @@ function App() {
       : status === 'connecting'
         ? 'Conectando...'
         : 'Transmisión detenida'
+
+  const formatStat = (value, digits = 3) => {
+    if (value === undefined || value === null) return '-'
+    const numeric = Number(value)
+    if (Number.isNaN(numeric)) return '-'
+    return numeric.toFixed(digits)
+  }
 
   const toggleTransmission = () => {
     if (!ready || status === 'connecting') return
@@ -345,6 +483,61 @@ function App() {
             Aún no hay respuesta del backend.
           </div>
         </section>
+
+        <section className="card">
+          <div className="section-label">Gráfica en vivo (θ vs tiempo)</div>
+          {liveChartData ? (
+            <LiveChart data={liveChartData} />
+          ) : (
+            <div className="placeholder boxed">Inicia la transmisión para ver la gráfica en tiempo real.</div>
+          )}
+          <div className="meta small">Se muestran los últimos {liveTimes.length} puntos.</div>
+        </section>
+
+        <section className="card">
+          <div className="section-label">Análisis del stream</div>
+          <div className="row space-between">
+            <div>
+              <div>Sesión actual</div>
+              <div className="meta">{sessionId}</div>
+              <div className="meta small">Puntos detectados: {samplesCount}</div>
+            </div>
+            <button
+              onClick={() => requestAnalysis(sessionIdRef.current)}
+              disabled={!ready || status === 'connecting'}
+            >
+              Generar gráfica y resumen
+            </button>
+          </div>
+          <div className="analysis-grid">
+            <div>
+              {analysisPlot ? (
+                <img src={analysisPlot} className="preview" alt="Gráfica del péndulo" />
+              ) : (
+                <div className="placeholder boxed">Genera la gráfica para verla aquí.</div>
+              )}
+            </div>
+            <div className="summary-panel">
+              {analysisError && <div className="error">{analysisError}</div>}
+              {analysisStatus && <div className="meta">{analysisStatus}</div>}
+              <div className="summary-lines">
+                {analysisSummary?.length
+                  ? analysisSummary.map((line, idx) => (
+                      <div key={idx} className="summary-line">
+                        {line}
+                      </div>
+                    ))
+                  : !analysisError && <div className="placeholder">Aún no hay resumen.</div>}
+              </div>
+              {analysisStats && (
+                <div className="meta small">
+                  Periodo: {formatStat(analysisStats.period)} s | Frecuencia: {formatStat(analysisStats.frequency)} Hz |
+                  Oscilaciones: {analysisStats.oscillations != null ? formatStat(analysisStats.oscillations, 2) : '-'}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
       </main>
 
       <video ref={cameraRef} playsInline muted autoPlay className="hidden" />
@@ -354,3 +547,47 @@ function App() {
 }
 
 export default App
+
+function LiveChart({ data }) {
+  const { times, angles, smooth, maxAbs } = data
+  const width = 700
+  const height = 260
+  const padding = 30
+  const span = Math.max(1, times[times.length - 1] - times[0])
+
+  const mapX = (t) => padding + ((t - times[0]) / span) * (width - padding * 2)
+  const mapY = (v) => {
+    const mid = height / 2
+    return mid - (v / (maxAbs || 1)) * (height / 2 - padding)
+  }
+
+  const toPoints = (xs, ys) => xs.map((t, i) => `${mapX(t)},${mapY(ys[i])}`).join(' ')
+
+  const rawPoints = toPoints(times, angles)
+  const smoothPoints = toPoints(times, smooth)
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} className="live-chart">
+      <defs>
+        <linearGradient id="bgGrid" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="rgba(255,255,255,0.05)" />
+          <stop offset="100%" stopColor="rgba(255,255,255,0.02)" />
+        </linearGradient>
+      </defs>
+      <rect x="0" y="0" width={width} height={height} fill="url(#bgGrid)" rx="12" />
+      <g stroke="rgba(255,255,255,0.08)" strokeWidth="1">
+        {[0.25, 0.5, 0.75].map((p) => (
+          <line key={p} x1={padding} x2={width - padding} y1={p * height} y2={p * height} />
+        ))}
+      </g>
+      <polyline points={rawPoints} fill="none" stroke="rgba(14,165,233,0.3)" strokeWidth="2" />
+      <polyline points={smoothPoints} fill="none" stroke="#0ea5e9" strokeWidth="3" />
+      <text x={padding} y={padding} fill="#e2e8f0" fontSize="12">
+        θ (°) máx ±{maxAbs.toFixed(1)}
+      </text>
+      <text x={width - padding} y={height - padding / 2} textAnchor="end" fill="#94a3b8" fontSize="12">
+        Tiempo (s) Δ{span.toFixed(2)}
+      </text>
+    </svg>
+  )
+}

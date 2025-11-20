@@ -353,6 +353,86 @@ def analysis_plot_csv():
         return jsonify({"error": "No se pudo generar la gráfica"}), 400
     return jsonify(output)
 
+def _summary_lines(stats: Optional[Dict]) -> list[str]:
+    """
+    Construye un resumen tipo pendulo_fisica.py a partir del dict de stats.
+    """
+    if not stats:
+        return []
+
+    lines = [
+        f"Muestras analizadas : {int(stats.get('samples', 0))}",
+        f"Tiempo total        : {float(stats.get('total_time', 0.0)):.3f} s",
+        f"Oscilaciones        : {float(stats.get('oscillations', 0.0)):.2f}",
+        f"Ángulo máximo       : {float(stats.get('max_angle_deg', 0.0)):.2f}°",
+        f"Longitud media      : {float(stats.get('length_px', 0.0)):.2f} px",
+        f"Centro usado        : X={float(stats.get('pivot_x', 0.0)):.2f}, Y={float(stats.get('pivot_y', 0.0)):.2f} px",
+        f"|θ'| máx            : {float(stats.get('max_ang_velocity', 0.0)):.4f} rad/s",
+        f"|θ''| máx           : {float(stats.get('max_ang_acceleration', 0.0)):.4f} rad/s²",
+    ]
+
+    period = stats.get("period")
+    frequency = stats.get("frequency")
+    angular_frequency = stats.get("angular_frequency")
+
+    if period:
+        lines.insert(3, f"Periodo (T)         : {float(period):.4f} s")
+    if frequency:
+        lines.insert(4, f"Frecuencia (f)      : {float(frequency):.4f} Hz")
+    if angular_frequency:
+        lines.insert(5, f"Pulsación (ω)       : {float(angular_frequency):.4f} rad/s")
+
+    return lines
+
+@app.route("/analysis/session_summary", methods=["POST"])
+def analysis_session_summary():
+    """
+    Genera la gráfica y el resumen físico usando los datos guardados desde el WebSocket.
+    Espera JSON {"session_id": "..."} y usa la misma lógica que main.py/graficar.py.
+    """
+    payload = request.get_json(silent=True, force=True) or {}
+    session_id = payload.get("session_id") or request.args.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id es requerido"}), 400
+
+    processor = session_store.get(session_id)
+    if not processor or not processor.has_data:
+        return jsonify({"error": "No hay datos para esa sesión"}), 404
+
+    pivot_x = processor.center_x if processor.center_x is not None else processor.default_pivot_x
+    pivot_y = processor.line_y if processor.line_y is not None else processor.default_pivot_y
+
+    output = build_plot_and_stats(
+        list(processor.time_series),
+        list(processor.x_series),
+        list(processor.y_series),
+        pivot_x=pivot_x,
+        pivot_y=pivot_y,
+        fallback_px=pivot_x,
+        fallback_py=pivot_y,
+    )
+
+    csv_info = session_csv_writers.get(session_id)
+    if csv_info:
+        csv_path, f_handle, _ = csv_info
+        try:
+            f_handle.flush()
+        except Exception:
+            pass
+        output["csv_path"] = str(csv_path)
+    elif processor.has_data:
+        export_path = Path(app.root_path).parent / f"datos_pendulo_{session_id}.csv"
+        processor.export_csv(str(export_path))
+        output["csv_path"] = str(export_path)
+
+    output["session_id"] = session_id
+    output["summary_lines"] = _summary_lines(output.get("stats"))
+
+    if not output.get("plot"):
+        return jsonify({"error": "No se pudo generar la gráfica"}), 400
+
+    return jsonify(output)
+
 
 # -------------------------------------------------------------------
 # MAIN
