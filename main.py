@@ -411,8 +411,8 @@ while True:
     cv2.putText(display, f"Tiempo: {tiempo_s:.2f} s", (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 0), 3)
 
-    cv2.putText(display, f"Oscilaciones: {int(oscillations)}", (20, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+    #cv2.putText(display, f"Oscilaciones: {int(oscillations)}", (20, 80), MOSTRAR OSCILACIONES EN PANTALLA
+    #            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
     # Línea mostrando inicio de la ROI inferior
     cv2.line(display, (0, ROI_TOP), (width, ROI_TOP), (255, 0, 0), 2)
@@ -450,4 +450,4 @@ else:
 print("\n[RESULTADOS] Listo")
 print("[RESULTADOS] Video marcado:", OUTPUT_VIDEO)
 print("[RESULTADOS] Datos guardados en:", CSV_PATH)
-print(f"[RESULTADOS] Oscilaciones detectadas: {int(oscillations)}")
+#print(f"[RESULTADOS] Oscilaciones detectadas: {int(oscillations)}")

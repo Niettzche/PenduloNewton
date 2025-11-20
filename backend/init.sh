@@ -1,0 +1,1 @@
+BACKEND_PORT=5000 USE_HTTPS=1 ./run_secure.sh
